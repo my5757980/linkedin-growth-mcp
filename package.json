@@ -1,0 +1,21 @@
+{
+  "name": "@mj4384963/linkedin-growth-mcp",
+  "version": "1.0.0",
+  "description": "LinkedIn MCP Server — post updates, share links, get profile via official LinkedIn API (free)",
+  "main": "index.js",
+  "type": "module",
+  "bin": {
+    "linkedin-growth-mcp": "index.js"
+  },
+  "scripts": {
+    "start": "node index.js",
+    "auth": "node auth.js"
+  },
+  "keywords": ["mcp", "mcp-server", "linkedin", "claude", "automation", "social-media"],
+  "author": "mj4384963",
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "dotenv": "^16.0.0"
+  }
+}
