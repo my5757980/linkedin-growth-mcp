@@ -5,7 +5,7 @@ import { spawn } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { resolve } from "node:path";
-import { TOOLS, createLinkedIn, postUrn } from "../tools.js";
+import { TOOLS, createLinkedIn, postUrn, littleText } from "../tools.js";
 
 const ME = "urn:li:person:abc123";
 const ACTIVITY = "urn:li:activity:7234567890123456789";
@@ -240,6 +240,157 @@ test("post_with_media stops before LinkedIn when the file is missing or of unkno
   assert.equal(unknown.isError, true);
   assert.match(textOf(unknown), /pass media_type/);
   assert.equal(fetch.calls.length, 0);
+});
+
+test("littleText escapes LinkedIn's reserved characters but keeps #hashtags and @mentions live", () => {
+  assert.equal(littleText("Hello (world) [1] {x} <a> 50% *b* _i_ ~s~ a|b back\\slash"),
+    "Hello \\(world\\) \\[1\\] \\{x\\} \\<a\\> 50% \\*b\\* \\_i\\_ \\~s\\~ a\\|b back\\\\slash");
+  assert.equal(littleText("Built with #AI and #MCP"), "Built with #AI and #MCP");
+  assert.equal(littleText("Thanks @[Anthropic](urn:li:organization:123)!"), "Thanks @[Anthropic](urn:li:organization:123)!");
+  assert.equal(littleText("mail me @ home, C# rocks"), "mail me \\@ home, C\\# rocks");
+  assert.equal(littleText("@[Jane_Doe](urn:li:person:Ab-1_c)"), "@[Jane\\_Doe](urn:li:person:Ab-1_c)");
+  assert.equal(littleText(undefined), "");
+});
+
+test("reshare_post escapes its text so a bracket cannot cut it short", async () => {
+  const fetch = fakeFetch({ status: 201, body: "", headers: { "x-restli-id": "urn:li:share:2" } });
+  await linkedIn(fetch)("reshare_post", { post: SHARE, text: "Must read (thread) #AI" });
+  assert.equal(JSON.parse(fetch.calls[0].body).commentary, "Must read \\(thread\\) #AI");
+});
+
+test("post_poll sends the question, answers and duration through the Posts API", async () => {
+  const fetch = fakeFetch({ status: 201, body: "", headers: { "x-restli-id": "urn:li:ugcPost:9" } });
+  const result = await linkedIn(fetch)("post_poll", {
+    text: "Quick poll #AI", question: "Which agent framework?", options: ["OpenAI SDK", " CrewAI ", "LangGraph"], duration: "three_days"
+  });
+  assert.equal(result.isError, undefined, textOf(result));
+  assert.match(textOf(result), /poll published \(open three days\)!\nID: urn:li:ugcPost:9/);
+  const [call] = fetch.calls;
+  assert.equal(call.url, "https://api.linkedin.com/rest/posts");
+  assert.equal(call.headers["Linkedin-Version"], "202609");
+  const body = JSON.parse(call.body);
+  assert.equal(body.author, ME);
+  assert.equal(body.commentary, "Quick poll #AI");
+  assert.deepEqual(body.content, {
+    poll: { question: "Which agent framework?", options: [{ text: "OpenAI SDK" }, { text: "CrewAI" }, { text: "LangGraph" }], settings: { duration: "THREE_DAYS" } }
+  });
+});
+
+test("post_poll stays open seven days unless told otherwise", async () => {
+  const fetch = fakeFetch({ status: 201, body: "", headers: { "x-restli-id": "urn:li:ugcPost:10" } });
+  await linkedIn(fetch)("post_poll", { text: "x", question: "Q?", options: ["A", "B"] });
+  assert.equal(JSON.parse(fetch.calls[0].body).content.poll.settings.duration, "SEVEN_DAYS");
+});
+
+test("post_poll checks LinkedIn's limits before sending anything", async () => {
+  const fetch = fakeFetch();
+  const call = args => linkedIn(fetch)("post_poll", { text: "x", question: "Q?", options: ["A", "B"], ...args });
+  for (const [args, msg] of [
+    [{ options: ["Only one"] }, /2 to 4 answers, not 1/],
+    [{ options: ["A", "B", "C", "D", "E"] }, /2 to 4 answers, not 5/],
+    [{ options: ["A", "x".repeat(31)] }, /1 to 30 characters/],
+    [{ options: ["Yes", "yes"] }, /must all be different/],
+    [{ question: "q".repeat(141) }, /1 to 140 characters/],
+    [{ duration: "FOREVER" }, /duration must be one of/]
+  ]) {
+    const result = await call(args);
+    assert.equal(result.isError, true);
+    assert.match(textOf(result), msg);
+  }
+  assert.equal(fetch.calls.length, 0);
+});
+
+test("post_document uploads the PDF through the Documents API, then posts it with its title", async () => {
+  const doc = "urn:li:document:D5510AQ";
+  const uploadUrl = "https://www.linkedin.com/dms-uploads/D5510AQ/uploaded-document/0?ca=vector";
+  const fetch = fakeFetch(
+    { json: { value: { uploadUrlExpiresAt: 1, uploadUrl, document: doc } } },
+    { status: 201, body: "" },
+    { status: 201, body: "", headers: { "x-restli-id": "urn:li:share:5" } }
+  );
+  const read = async () => Buffer.from("%PDF-1.7");
+  const result = await linkedIn(fetch, { read })("post_document", { text: "My deck (10 slides)", file: "C:\\decks\\agents.pdf" });
+  assert.equal(result.isError, undefined, textOf(result));
+  assert.match(textOf(result), /document post published!\nID: urn:li:share:5/);
+  const [init, upload, post] = fetch.calls;
+  assert.equal(init.url, "https://api.linkedin.com/rest/documents?action=initializeUpload");
+  assert.equal(init.headers["Linkedin-Version"], "202609");
+  assert.deepEqual(JSON.parse(init.body), { initializeUploadRequest: { owner: ME } });
+  assert.equal(upload.url, uploadUrl);
+  assert.equal(upload.method, "PUT");
+  assert.equal(upload.headers.Authorization, "Bearer test-token");
+  assert.equal(upload.headers["Content-Type"], "application/pdf");
+  assert.equal(Buffer.from(upload.body).toString(), "%PDF-1.7");
+  const body = JSON.parse(post.body);
+  assert.equal(body.commentary, "My deck \\(10 slides\\)");
+  assert.deepEqual(body.content, { media: { title: "agents.pdf", id: doc } });
+});
+
+test("post_document refuses a file that is not a PDF, PowerPoint or Word document", async () => {
+  const fetch = fakeFetch();
+  const result = await linkedIn(fetch, { read: async () => Buffer.from("hi") })("post_document", { text: "x", file: "/tmp/notes.txt" });
+  assert.equal(result.isError, true);
+  assert.match(textOf(result), /takes a \.pdf, \.ppt, \.pptx, \.doc or \.docx file, not "notes\.txt"/);
+  assert.equal(fetch.calls.length, 0);
+});
+
+test("post_multi_image checks every file first, uploads each through the Images API, then posts them in order", async () => {
+  const up = n => `https://www.linkedin.com/dms-uploads/IMG${n}/uploaded-image/0`;
+  const fetch = fakeFetch(
+    { json: { value: { uploadUrl: up(1), image: "urn:li:image:IMG1" } } },
+    { status: 201, body: "" },
+    { json: { value: { uploadUrl: up(2), image: "urn:li:image:IMG2" } } },
+    { status: 201, body: "" },
+    { status: 201, body: "", headers: { "x-restli-id": "urn:li:share:7" } }
+  );
+  const reads = [];
+  const read = async path => { reads.push(path); return Buffer.from(`BYTES-${reads.length}`); };
+  const result = await linkedIn(fetch, { read })("post_multi_image", {
+    text: "Two shots", files: ["C:\\a\\one.jpg", "C:\\a\\two.png"], alt_texts: ["First", ""]
+  });
+  assert.equal(result.isError, undefined, textOf(result));
+  assert.match(textOf(result), /with 2 images published!\nID: urn:li:share:7/);
+  assert.equal(reads.length, 2);
+  const [init1, put1, init2, put2, post] = fetch.calls;
+  assert.equal(init1.url, "https://api.linkedin.com/rest/images?action=initializeUpload");
+  assert.deepEqual(JSON.parse(init1.body), { initializeUploadRequest: { owner: ME } });
+  assert.equal(put1.url, up(1));
+  assert.equal(put1.headers["Content-Type"], "image/jpeg");
+  assert.equal(init2.url, init1.url);
+  assert.equal(put2.headers["Content-Type"], "image/png");
+  assert.deepEqual(JSON.parse(post.body).content, {
+    multiImage: { images: [{ id: "urn:li:image:IMG1", altText: "First" }, { id: "urn:li:image:IMG2" }] }
+  });
+});
+
+test("post_multi_image refuses fewer than 2, more than 20, or a non-image file before uploading anything", async () => {
+  const fetch = fakeFetch();
+  const read = async () => Buffer.from("x");
+  const one = await linkedIn(fetch, { read })("post_multi_image", { text: "x", files: ["/a.png"] });
+  assert.match(textOf(one), /2 to 20 images, not 1/);
+  const many = await linkedIn(fetch, { read })("post_multi_image", { text: "x", files: Array.from({ length: 21 }, (_, i) => `/p${i}.png`) });
+  assert.match(textOf(many), /2 to 20 images, not 21/);
+  const video = await linkedIn(fetch, { read })("post_multi_image", { text: "x", files: ["/a.png", "/clip.mp4"] });
+  assert.match(textOf(video), /clip\.mp4 is not a JPG, PNG or GIF image/);
+  assert.equal(fetch.calls.length, 0);
+});
+
+test("edit_post sets the new text with a PARTIAL_UPDATE and refuses an activity URL", async () => {
+  const fetch = fakeFetch({ status: 204 });
+  const result = await linkedIn(fetch)("edit_post", { post: SHARE, text: "Updated (v2) #AI" });
+  assert.equal(result.isError, undefined, textOf(result));
+  assert.match(textOf(result), /Updated the text of urn:li:share:/);
+  const [call] = fetch.calls;
+  assert.equal(call.url, `https://api.linkedin.com/rest/posts/${encodeURIComponent(SHARE)}`);
+  assert.equal(call.method, "POST");
+  assert.equal(call.headers["X-RestLi-Method"], "PARTIAL_UPDATE");
+  assert.equal(call.headers["Linkedin-Version"], "202609");
+  assert.deepEqual(JSON.parse(call.body), { patch: { $set: { commentary: "Updated \\(v2\\) #AI" } } });
+
+  const none = fakeFetch();
+  const refused = await linkedIn(none)("edit_post", { post: `https://www.linkedin.com/feed/update/${ACTIVITY}/`, text: "x" });
+  assert.equal(refused.isError, true);
+  assert.equal(none.calls.length, 0);
 });
 
 test("an expired token says how to renew it, and a missing token never calls LinkedIn", async () => {
